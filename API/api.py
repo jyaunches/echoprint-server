@@ -64,8 +64,8 @@ class query:
     def GET(self):
         stuff = web.input(fp_code="")
         response = fp.best_match_for_query(stuff.fp_code)
-        return dict(json.dumps({"ok":True, "query":stuff.fp_code, "message":response.message(), "match":response.match(), "score":response.score, \
-                        "qtime":response.qtime, "track_id":response.TRID, "total_time":response.total_time}) + response.metadata)
+        return json.dumps(dict({"ok":True, "query":stuff.fp_code, "message":response.message(), "match":response.match(), "score":response.score, \
+                        "qtime":response.qtime, "track_id":response.TRID, "total_time":response.total_time} + response.metadata))
 
 
 application = web.application(urls, globals())#.wsgifunc()
