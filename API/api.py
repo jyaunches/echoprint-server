@@ -65,7 +65,7 @@ class query:
         stuff = web.input(fp_code="")
         response = fp.best_match_for_query(stuff.fp_code)
         return json.dumps(dict({"ok":True, "query":stuff.fp_code, "message":response.message(), "match":response.match(), "score":response.score, \
-                        "qtime":response.qtime, "track_id":response.TRID, "total_time":response.total_time} + response.metadata))
+                        "qtime":response.qtime, "track_id":response.TRID, "total_time":response.total_time}.items() + response.metadata.items()))
 
 
 application = web.application(urls, globals())#.wsgifunc()
