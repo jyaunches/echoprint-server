@@ -64,7 +64,6 @@ class query:
     def GET(self):
         stuff = web.input(fp_code="")
         response = fp.best_match_for_query(stuff.fp_code)
-        self.send_header("Content-type", "application/json")
         return json.dumps({"ok":True, "query":stuff.fp_code, "message":response.message(), "match":response.match(), "score":response.score, \
                         "qtime":response.qtime, "track_id":response.TRID, "total_time":response.total_time, "meta-data":response.metadata})
 
