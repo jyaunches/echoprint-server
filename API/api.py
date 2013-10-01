@@ -30,7 +30,7 @@ urls = (
 
 class erase:
     def DELETE(self):
-        fp.erase_database(really_delete=False, local=False)
+        fp.erase_database(really_delete=True, local=False)
 
 class ingest:
     def POST(self):
