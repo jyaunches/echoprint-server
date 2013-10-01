@@ -24,8 +24,13 @@ urls = (
     '/query', 'query',
     '/query?(.*)', 'query',
     '/ingest', 'ingest',
+    '/erase_database', 'erase'
 )
 
+
+class erase:
+    def DELETE(self):
+        fp.erase_database(true, true)
 
 class ingest:
     def POST(self):
