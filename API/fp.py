@@ -14,6 +14,7 @@ from collections import defaultdict
 import zlib, base64, re, time, random, string, math
 import pytyrant
 import datetime
+from difflib import SequenceMatcher as sm
 
 now = datetime.datetime.utcnow()
 IMPORTDATE = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -47,7 +48,7 @@ class Response(object):
             return 1
         else:
             return 0
-        
+
     def message(self):
         if self.code == self.NOT_ENOUGH_CODE:
             return "query code length is too small"
@@ -56,10 +57,10 @@ class Response(object):
         if self.code == self.SINGLE_BAD_MATCH or self.code == self.NO_RESULTS or self.code == self.MULTIPLE_BAD_HISTOGRAM_MATCH:
             return "no results found (type %d)" % (self.code)
         return "OK (match type %d)" % (self.code)
-    
+
     def match(self):
         return self.TRID is not None
-     
+
 
 def inflate_code_string(s):
     """ Takes an uncompressed code string consisting of 0-padded fixed-width
@@ -81,9 +82,48 @@ def inflate_code_string(s):
     end_timestamps = n*5
     times = [int(''.join(t), 16) for t in chunker(s[:end_timestamps], 5)]
     codes = [int(''.join(t), 16) for t in chunker(s[end_timestamps:], 5)]
-
+    #print codes,"---------------------", times
+    #print len(times), len(codes)
     assert(len(times) == len(codes)) # these should match up!
     return ' '.join('%d %d' % (c, t) for c,t in zip(codes, times))
+
+
+from math import floor
+def shiftThrough(codes):
+    chunk = 200
+    mult = 30;
+    codeList = codes.split(' ')
+    length = len(codeList)
+    if length < 400:
+        return best_match_for_query(codes)
+
+    if (length < chunk+mult+1):
+        chunk = 150
+        mult = 2
+    if (length-chunk)/mult < 4:
+        mult = mult/4
+    numSegs = int(floor(length/chunk))
+    results = []
+    resultsDict = {}
+    for i in range((length-chunk)/mult):
+        print i*mult, ':',chunk+i*mult, length, (length-chunk)/mult
+        result = best_match_for_query(' '.join(codeList[i*mult:chunk+i*mult]))
+        if result.TRID:
+            try:
+                resultsDict[result.TRID] = [result,resultsDict[result.TRID][1]+1]
+            except:
+                resultsDict[result.TRID] = [result,0]
+            if resultsDict[result.TRID][1]>10:
+                break
+
+    resultsList = sorted(resultsDict.values(), key=lambda x:x[1])
+
+    if resultsList:
+        return resultsList[0][0]
+    else:
+        print "no results"
+        return 0
+
 
 def decode_code_string(compressed_code_string):
     compressed_code_string = compressed_code_string.encode('utf8')
@@ -108,10 +148,10 @@ def metadata_for_track_id(track_id, local=False):
     # Assume track_ids have 1 - and it's at the end of the id.
     if "-" not in track_id:
         track_id = "%s-0" % track_id
-        
+
     if local:
         return _fake_solr["metadata"][track_id]
-        
+
     with solr.pooled_connection(_fp_solr) as host:
         response = host.query("track_id:%s" % track_id)
 
@@ -140,6 +180,12 @@ def cut_code_string_length(code_string):
             parts.append(t)
     return " ".join(parts)
 
+def delete_key(key):
+    get_tyrant().delete_key(key)
+    print "deleted key"
+    return;
+
+
 def best_match_for_query(code_string, elbow=10, local=False):
     # DEC strings come in as unicode so we have to force them to ASCII
     code_string = code_string.encode("utf8")
@@ -150,7 +196,7 @@ def best_match_for_query(code_string, elbow=10, local=False):
         code_string = decode_code_string(code_string)
         if code_string is None:
             return Response(Response.CANNOT_DECODE, tic=tic)
-    
+
     code_len = len(code_string.split(" ")) / 2
     if code_len < elbow:
         logger.warn("Query code length (%d) is less than elbow (%d)" % (code_len, elbow))
@@ -162,7 +208,7 @@ def best_match_for_query(code_string, elbow=10, local=False):
     # Query the FP flat directly.
     response = query_fp(code_string, rows=30, local=local, get_data=True)
     logger.debug("solr qtime is %d" % (response.header["QTime"]))
-    
+
     if len(response.results) == 0:
         return Response(Response.NO_RESULTS, qtime=response.header["QTime"], tic=tic)
 
@@ -186,13 +232,13 @@ def best_match_for_query(code_string, elbow=10, local=False):
     # Get the actual score for all responses
     original_scores = {}
     actual_scores = {}
-    
+
     trackids = [r["track_id"].encode("utf8") for r in response.results]
     if local:
         tcodes = [_fake_solr["store"][t] for t in trackids]
     else:
         tcodes = get_tyrant().multi_get(trackids)
-    
+
     # For each result compute the "actual score" (based on the histogram matching)
     for (i, r) in enumerate(response.results):
         track_id = r["track_id"]
@@ -203,11 +249,11 @@ def best_match_for_query(code_string, elbow=10, local=False):
             # is not in our keystore
             continue
         actual_scores[track_id] = actual_matches(code_string, track_code, elbow = elbow)
-    
+
     #logger.debug("Actual score for %s is %d (code_len %d), original was %d" % (r["track_id"], actual_scores[r["track_id"]], code_len, top_match_score))
     # Sort the actual scores
     sorted_actual_scores = sorted(actual_scores.iteritems(), key=lambda (k,v): (v,k), reverse=True)
-    
+
     # Because we split songs up into multiple parts, sometimes the results will have the same track in the
     # first few results. Remove these duplicates so that the falloff is (potentially) higher.
     new_sorted_actual_scores = []
@@ -219,6 +265,39 @@ def best_match_for_query(code_string, elbow=10, local=False):
             existing_trids.append(trid_split)
     sorted_actual_scores = new_sorted_actual_scores
 
+    #remove duplicate matches - happens when same song appears in database
+    new_sorted_actual_scores = []
+    trid,result = sorted_actual_scores[0]
+    metaTop = metadata_for_track_id(trid, local=local)
+    try:
+        topArtist = metaTop['artist']
+    except:
+        topArtist = 'NA'
+    try:
+        topTrack = metaTop['track']
+    except:
+        topTrack = 'NA'
+
+
+    new_sorted_actual_scores.append((trid, result))
+    for trid, result in sorted_actual_scores:
+        trid_split = trid.split("-")[0]
+        meta = metadata_for_track_id(trid, local=local)
+        try:
+            artist = meta['artist']
+        except:
+            artist = 'NA'
+        try:
+            track = meta['track']
+        except:
+            track = 'NA'
+
+        if sm(None, artist, topArtist).ratio()< 0.6 and sm(None, track, topTrack).ratio() < 0.6:
+            new_sorted_actual_scores.append((trid, result))
+            existing_trids.append(trid_split)
+    sorted_actual_scores = new_sorted_actual_scores
+
+
     # We might have reduced the length of the list to 1
     if len(sorted_actual_scores) == 1:
         logger.info("only have 1 score result...")
@@ -227,7 +306,7 @@ def best_match_for_query(code_string, elbow=10, local=False):
             logger.info("only result less than 10%% of the query string (%d < %d *0.1 (%d)) SINGLE_BAD_MATCH", top_score, code_len, code_len*0.1)
             return Response(Response.SINGLE_BAD_MATCH, qtime = response.header["QTime"], tic=tic)
         else:
-            if top_score > (original_scores[top_track_id] / 2): 
+            if top_score > (original_scores[top_track_id] / 2):
                 logger.info("top_score > original_scores[%s]/2 (%d > %d) GOOD_MATCH_DECREASED",
                     top_track_id, top_score, original_scores[top_track_id]/2)
                 trid = top_track_id.split("-")[0]
@@ -237,7 +316,7 @@ def best_match_for_query(code_string, elbow=10, local=False):
                 logger.info("top_score NOT > original_scores[%s]/2 (%d <= %d) BAD_HISTOGRAM_MATCH",
                     top_track_id, top_score, original_scores[top_track_id]/2)
                 return Response(Response.MULTIPLE_BAD_HISTOGRAM_MATCH, qtime=response.header["QTime"], tic=tic)
-        
+
     # Get the top one
     (actual_score_top_track_id, actual_score_top_score) = sorted_actual_scores[0]
     # Get the 2nd top one (we know there is always at least 2 matches)
@@ -245,12 +324,12 @@ def best_match_for_query(code_string, elbow=10, local=False):
 
     trackid = actual_score_top_track_id.split("-")[0]
     meta = metadata_for_track_id(trackid, local=local)
-    
+
     if actual_score_top_score < code_len * 0.05:
         return Response(Response.MULTIPLE_BAD_HISTOGRAM_MATCH, qtime = response.header["QTime"], tic=tic)
     else:
         # If the actual score went down it still could be close enough, so check for that
-        if actual_score_top_score > (original_scores[actual_score_top_track_id] / 4): 
+        if actual_score_top_score > (original_scores[actual_score_top_track_id] / 4):
             if (actual_score_top_score - actual_score_2nd_score) >= (actual_score_top_score / 3):  # for examples [10,4], 10-4 = 6, which >= 5, so OK
                 return Response(Response.MULTIPLE_GOOD_MATCH_HISTOGRAM_DECREASED, TRID=trackid, score=actual_score_top_score, qtime=response.header["QTime"], tic=tic, metadata=meta)
             else:
@@ -271,7 +350,7 @@ def actual_matches(code_string_query, code_string_match, slop = 2, elbow = 10):
     code_query_int = [int(x) for x in code_query]
     min_time = min(code_query_int[1::2])
     code_query[1::2] = [str(x - min_time) for x in code_query_int[1::2]]
-    
+
     #
     # Invert the query codes
     query_codes = {}
@@ -310,7 +389,7 @@ def actual_matches(code_string_query, code_string_match, slop = 2, elbow = 10):
         return actual_match_list[0][1] + actual_match_list[1][1]
     if(len(actual_match_list)>0):
         return actual_match_list[0][1]
-    return 0        
+    return 0
 
 def get_tyrant():
     global _tyrant
@@ -322,10 +401,10 @@ def get_tyrant():
     fp can query the live production flat or the alt flat, or it can query and ingest in memory.
     the following few functions are to support local query and ingest that ape the response of the live server
     This is useful for small collections and testing, deduplicating, etc, without having to boot a server.
-    The results should be equivalent but i need to run tests. 
-    
+    The results should be equivalent but i need to run tests.
+
     NB: delete is not supported locally yet
-    
+
 """
 _fake_solr = {"index": {}, "store": {}, "metadata": {}}
 
@@ -345,7 +424,7 @@ class FakeSolrResponse(object):
                 self.results.append(data)
             else:
                 self.results.append({"score":r[1], "track_id":r[0]})
-    
+
 def local_load(filename):
     global _fake_solr
     print "Loading from " + filename
@@ -353,14 +432,14 @@ def local_load(filename):
     _fake_solr = pickle.load(disk)
     disk.close()
     print "Done"
-    
+
 def local_save(filename):
     print "Saving to " + filename
     disk = open(filename,"wb")
     pickle.dump(_fake_solr,disk)
     disk.close()
     print "Done"
-    
+
 def local_ingest(docs, codes):
     store = dict(codes)
     _fake_solr["store"].update(store)
@@ -395,7 +474,7 @@ def local_delete(tracks):
                         pass
             if len(_fake_solr["index"][code]) == 0:
                 del _fake_solr["index"][code]
-        
+
 
 def local_dump():
     print "Stored tracks:"
@@ -425,7 +504,7 @@ def local_query_fp(code_string,rows=10,get_data=False):
         # Make a list of lists that have track_id, score, then fp
         lol = sorted(top_matches.iteritems(), key=lambda (k,v): (v,k), reverse=True)[0:rows]
         lol = map(list, lol)
-        
+
         for x in lol:
             trackid = x[0].split("-")[0]
             x.append(_fake_solr["store"][x[0]])
@@ -434,13 +513,13 @@ def local_query_fp(code_string,rows=10,get_data=False):
 
 def local_fp_code_for_track_id(track_id):
     return _fake_solr["store"][track_id]
-    
+
 """
-    and these are the server-hosted versions of query, ingest and delete 
+    and these are the server-hosted versions of query, ingest and delete
 """
 
 def delete(track_ids, do_commit=True, local=False):
-    # delete one or more track_ids from the fp flat. 
+    # delete one or more track_ids from the fp flat.
     if not isinstance(track_ids, list):
         track_ids = [track_ids]
 
@@ -451,12 +530,12 @@ def delete(track_ids, do_commit=True, local=False):
     with solr.pooled_connection(_fp_solr) as host:
         for t in track_ids:
             host.delete_query("track_id:%s*" % t)
-    
+
     try:
         get_tyrant().multi_del(track_ids)
     except KeyError:
         pass
-    
+
     if do_commit:
         commit()
 
@@ -467,7 +546,7 @@ def local_erase_database():
 def erase_database(really_delete=False, local=False):
     """ This method will delete your ENTIRE database. Only use it if you
         know what you're doing.
-    """ 
+    """
     if not really_delete:
         raise Exception("Won't delete unless you pass in really_delete=True")
 
@@ -492,7 +571,7 @@ def split_codes(fp):
     # Convert seconds into time units
     segmentlength = 60 * 1000.0 / 23.2
     halfsegment = segmentlength / 2.0
-    
+
     trid = fp["track_id"]
     codestring = fp["fp"]
 
@@ -515,7 +594,7 @@ def split_codes(fp):
         s = i * halfsegment
         e = i * halfsegment + segmentlength
         #print i, s, e
-        
+
         while sindex < size and pairs[sindex][0] < s:
             #print "s", sindex, l[sindex]
             sindex+=1
@@ -524,7 +603,7 @@ def split_codes(fp):
             #print "e",eindex,l[eindex]
             eindex+=1
         key = "%s-%d" % (trid, i)
-        
+
         segment = {"track_id": key,
                    "fp": " ".join((p[1]) for p in pairs[sindex:eindex]),
                    "length": fp["length"],
@@ -559,7 +638,7 @@ def ingest(fingerprint_list, do_commit=True, local=False, split=True):
     """
     if not isinstance(fingerprint_list, list):
         fingerprint_list = [fingerprint_list]
-        
+
     docs = []
     codes = []
     if split:
@@ -588,6 +667,7 @@ def ingest(fingerprint_list, do_commit=True, local=False, split=True):
     if do_commit:
         commit()
 
+
 def commit(local=False):
     with solr.pooled_connection(_fp_solr) as host:
         host.commit()
@@ -595,7 +675,7 @@ def commit(local=False):
 def query_fp(code_string, rows=15, local=False, get_data=False):
     if local:
         return local_query_fp(code_string, rows, get_data=get_data)
-    
+
     try:
         # query the fp flat
         if get_data:
@@ -611,7 +691,7 @@ def query_fp(code_string, rows=15, local=False, get_data=False):
 def fp_code_for_track_id(track_id, local=False):
     if local:
         return local_fp_code_for_track_id(track_id)
-    
+
     return get_tyrant().get(track_id.encode("utf-8"))
 
 def new_track_id():
@@ -619,11 +699,11 @@ def new_track_id():
     global _hexpoch
     _hexpoch += 1
     hexpoch = str(hex(_hexpoch))[2:].upper()
-    ## On 32-bit machines, the number of milliseconds since 1970 is 
+    ## On 32-bit machines, the number of milliseconds since 1970 is
     ## a longint. On 64-bit it is not.
     hexpoch = hexpoch.rstrip('L')
     return "TR" + rand5 + hexpoch
 
 
-    
+
 
